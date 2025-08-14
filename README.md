@@ -125,7 +125,7 @@ docker-compose build --no-cache
 
 ### Ejecutar la aplicación
 ```bash
-docker-compose up 
+docker-compose up backend
 ```
 
 ## 📖 Documentación de la API
