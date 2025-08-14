@@ -134,6 +134,10 @@ docker-compose up backend
 La documentación estará disponible en:  
 👉 [http://localhost:8000/docs](http://localhost:8000/docs)
 
+## ⚠️ Nota sobre el proceso de pago
+
+La API implementa un **proceso de pago simulado**, en el cual cada transacción tiene un **50% de probabilidad** de éxito o fallo.
+
 ## Flujo de arquitectura
 ![Diagrama de arquitectura](resources/flow_architecture_ecommerce.png)
 

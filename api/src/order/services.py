@@ -94,8 +94,7 @@ class OrderService:
             for item in items:
                 product, inventory = await self._fetch_product_and_inventory(item["sku"])
 
-                max_purchasable = inventory.available_quantity - inventory.reserved_quantity
-                if item["quantity"] > max_purchasable:
+                if item["quantity"] > inventory.available_quantity:
                     raise OrderInventoryError(
                         f"Insufficient inventory for {item['sku']}. "
                         f"Requested: {item['quantity']}, "
