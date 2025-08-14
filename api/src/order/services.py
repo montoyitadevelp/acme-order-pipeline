@@ -1,5 +1,6 @@
 import datetime
 import asyncio
+import random
 from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -12,6 +13,7 @@ from src.order.event.producer import KafkaProducer
 from fastapi_pagination import Params
 from fastapi_pagination.ext.motor import apaginate
 from src.inventory.models import Inventory
+from src.utils.general import generate_order_hash
 
 
 class OrderService:
@@ -21,10 +23,7 @@ class OrderService:
         self.producer = kafka_producer
 
     async def get_orders_by_user(self, user_id: str, params: Params = Params()):
-        """
-        Retrieve paginated orders for a specific user.
-        Returns simplified structure with order_id, status, total, created_at
-        """
+        """Retrieve paginated orders for a specific user."""
         try:
             query_filter = {"customer.user_id": user_id}
             paginated = await apaginate(
@@ -58,34 +57,42 @@ class OrderService:
         return order_doc
 
     async def _fetch_product_and_inventory(self, sku: str):
-        """
-        Fetch product and its inventory details by SKU.
-        """
-        try:
-            result = await self.db.execute(
-                select(Product)
-                .options(selectinload(Product.inventory))
-                .where(Product.sku == sku)
-            )
-            product = result.scalars().first()
-            if not product:
-                raise OrderProductNotFound(f"Product with SKU '{sku}' not found.")
-            if not product.inventory:
-                raise OrderInventoryError(f"Inventory for SKU '{sku}' not found.")
-            return product, product.inventory
-        except (OrderProductNotFound, OrderInventoryError):
-            raise
-        except Exception as e:
-            raise ValueError({
-                "message": "Failed to fetch product and inventory",
-                "method": "OrderService._fetch_product_and_inventory",
-                "error": str(e)
-            })
+        """Fetch product and its inventory details by SKU."""
+        result = await self.db.execute(
+            select(Product)
+            .options(selectinload(Product.inventory))
+            .where(Product.sku == sku)
+        )
+        product = result.scalars().first()
+        if not product:
+            raise OrderProductNotFound(f"Product with SKU '{sku}' not found.")
+        if not product.inventory:
+            raise OrderInventoryError(f"Inventory for SKU '{sku}' not found.")
+        return product, product.inventory
 
     async def create_order(self, customer: dict, items: list[dict]):
         """
         Create a new order.
+        Implements idempotency by checking if the user already has a 
+        pending/processing order with the same items.
         """
+        order_hash = generate_order_hash(customer, items)
+
+        # Check for existing order with same hash
+        existing_order = await self.mongo_db.orders.find_one({
+            "idempotency_hash": order_hash,
+            "status": {"$in": ["pending", "processing"]}
+        })
+
+        if existing_order:
+            return {
+                "order_id": existing_order["order_id"],
+                "status": existing_order["status"],
+                "estimated_total": existing_order["pricing"]["total"],
+                "created_at": existing_order["created_at"].isoformat(),
+                "message": "Duplicate order detected, returning existing order"
+            }
+
         order_id = f"ORD-{generate_short_uuid()}"
         subtotal = Decimal("0")
         reserved_items = []
@@ -98,7 +105,7 @@ class OrderService:
                     raise OrderInventoryError(
                         f"Insufficient inventory for {item['sku']}. "
                         f"Requested: {item['quantity']}, "
-                        f"Available: {inventory.available_quantity}, "
+                        f"Available: {inventory.available_quantity}"
                     )
 
                 inventory.available_quantity -= item["quantity"]
@@ -108,7 +115,8 @@ class OrderService:
                 reserved_items.append({
                     "sku": item["sku"],
                     "quantity": item["quantity"],
-                    "price": float(product.price)
+                    "price": float(product.price),
+                    "name": product.name
                 })
                 subtotal += Decimal(str(product.price)) * Decimal(str(item["quantity"]))
             await self.db.commit()
@@ -121,14 +129,28 @@ class OrderService:
 
         order_doc = {
             "order_id": order_id,
+            "idempotency_hash": order_hash,
             "status": "pending",
-            "customer": customer,
+            "customer": {
+                "user_id": customer["user_id"],
+                "email": customer.get("email"),
+            },
             "items": reserved_items,
-            "pricing": {"subtotal": float(subtotal), "tax": float(tax), "total": float(total)},
-            "payment": {"status": "pending", "transaction_id": generate_short_uuid()},
+            "pricing": {
+                "subtotal": float(subtotal),
+                "tax": float(tax),
+                "total": float(total)
+            },
+            "payment": {
+                "status": "pending",
+                "transaction_id": generate_short_uuid(),
+                "method": "mock_gateway"
+            },
             "created_at": datetime.datetime.now(),
             "updated_at": datetime.datetime.now(),
+            
         }
+
         try:
             await self.mongo_db.orders.insert_one(order_doc)
         except Exception as e:
@@ -155,33 +177,39 @@ class OrderService:
             if payment_success:
                 await self.mongo_db.orders.update_one(
                     {"order_id": order_id},
-                    {"$set": {"status": "processing", "payment.status": "completed", "updated_at": datetime.datetime.now()}}
+                    {"$set": {
+                        "status": "processing",
+                        "payment.status": "completed",
+                        "audit.updated_at": datetime.datetime.now()
+                    }}
                 )
             else:
                 await self.mongo_db.orders.update_one(
                     {"order_id": order_id},
-                    {"$set": {"status": "cancelled", "payment.status": "failed", "updated_at": datetime.datetime.now()}}
+                    {"$set": {
+                        "status": "cancelled",
+                        "payment.status": "failed",
+                        "audit.updated_at": datetime.datetime.now()
+                    }}
                 )
                 await self._release_reserved_inventory(reserved_items)
                 return
 
-            # Publish event asynchronously
             try:
                 await self.producer.publish_order_created(order_id, customer, reserved_items)
                 final_status = "confirmed"
             except Exception:
                 final_status = "processing"
 
-            # Update final status
             await self.mongo_db.orders.update_one(
                 {"order_id": order_id},
-                {"$set": {"status": final_status, "updated_at": datetime.datetime.now()}}
+                {"$set": {"status": final_status, "audit.updated_at": datetime.datetime.now()}}
             )
 
         except Exception:
             await self.mongo_db.orders.update_one(
                 {"order_id": order_id},
-                {"$set": {"status": "error", "updated_at": datetime.datetime.now()}}
+                {"$set": {"status": "error", "audit.updated_at": datetime.datetime.now()}}
             )
             await self._release_reserved_inventory(reserved_items)
 
@@ -195,6 +223,5 @@ class OrderService:
         await self.db.commit()
 
     async def _simulate_payment(self) -> bool:
-        import random
-        await asyncio.sleep(1)  # Simulate payment
-        return random.random() > 0.55
+        await asyncio.sleep(3)
+        return random.random() >= 0.5
