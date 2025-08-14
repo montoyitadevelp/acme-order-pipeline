@@ -1,0 +1,38 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.log
+
+# --- Virtual environments ---
+api/src/venv/
+# In case someone creates one in root
+venv/
+.env/
+env/
+ENV/
+
+# --- Environment & secrets ---
+.env
+*.env
+*.key
+*.pem
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- OS specific ---
+.DS_Store
+Thumbs.db
+
+# --- Docker ---
+*.pid
+*.seed
+*.bak
+*.backup
+*.tmp
